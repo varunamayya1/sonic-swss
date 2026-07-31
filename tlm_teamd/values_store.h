@@ -55,6 +55,7 @@ private:
         { "runner.retry_count",                ValuesStore::json_type::integer },
         { "runner.min_ports",                  ValuesStore::json_type::integer },
         { "runner.sys_prio",                   ValuesStore::json_type::integer },
+        { "runner.fallback_timeout",           ValuesStore::json_type::integer },
         { "team_device.ifinfo.dev_addr",       ValuesStore::json_type::string  },
         { "team_device.ifinfo.ifindex",        ValuesStore::json_type::integer },
     };
