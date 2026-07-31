@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <set>
 #include <string>
 
@@ -34,6 +35,7 @@ private:
     ProducerStateTable m_appLagTable;
 
     std::set<std::string> m_lagList;
+    std::map<std::string, bool> m_lagActive;
 
     MacAddress m_mac;
 
@@ -42,7 +44,8 @@ private:
     void doLagMemberTask(Consumer &consumer);
     void doPortUpdateTask(Consumer &consumer);
 
-    task_process_status addLag(const std::string &alias, int min_links, bool fall_back, bool fast_rate);
+    task_process_status addLag(const std::string &alias, int min_links, bool fall_back,
+                               uint16_t fall_back_timeout, bool fast_rate, bool active);
     bool removeLag(const std::string &alias);
     task_process_status addLagMember(const std::string &lag, const std::string &member);
     bool removeLagMember(const std::string &lag, const std::string &member);

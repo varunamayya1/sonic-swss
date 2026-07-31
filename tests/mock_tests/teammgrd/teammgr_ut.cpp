@@ -356,6 +356,55 @@ namespace teammgr_ut
         EXPECT_EQ(mockKillCommands.size(), 0);
     }
 
+    TEST_F(TeamMgrTest, testAddLagWithFallbackTimeout)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel601", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "fallback", "true" },
+                                            { "fallback_timeout", "120" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel601"), std::string::npos);
+        EXPECT_NE(mockCallArgs.front().find("\"fallback\":true"), std::string::npos);
+        EXPECT_NE(mockCallArgs.front().find("\"fallback_timeout\":120"), std::string::npos);
+    }
+
+    TEST_F(TeamMgrTest, testAddLagFallbackUsesDefaultTimeout)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel602", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "fallback", "true" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel602"), std::string::npos);
+        EXPECT_NE(mockCallArgs.front().find("\"fallback\":true"), std::string::npos);
+        EXPECT_NE(mockCallArgs.front().find("\"fallback_timeout\":90"), std::string::npos);
+    }
+
+    TEST_F(TeamMgrTest, testAddLagFallbackTimeoutIgnoredWithoutFallback)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel603", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "fallback_timeout", "120" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel603"), std::string::npos);
+        EXPECT_EQ(mockCallArgs.front().find("\"fallback\""), std::string::npos);
+        EXPECT_EQ(mockCallArgs.front().find("\"fallback_timeout\""), std::string::npos);
+    }
+
     TEST_F(TeamMgrTest, testSleepDuringCleanup)
     {
         swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);

@@ -25,6 +25,8 @@
 using namespace std;
 using namespace swss;
 
+#define DEFAULT_LACP_FALLBACK_TIMEOUT 90
+
 
 TeamMgr::TeamMgr(DBConnector *confDb, DBConnector *applDb, DBConnector *statDb,
         const vector<TableConnector> &tables) :
@@ -247,7 +249,11 @@ void TeamMgr::doLagTask(Consumer &consumer)
         {
             int min_links = 0;
             bool fallback = false;
+            bool fallback_timeout_set = false;
+            uint16_t fallback_timeout = DEFAULT_LACP_FALLBACK_TIMEOUT;
             bool fast_rate = false;
+            bool active = true;
+            bool active_present = false;
             string admin_status = DEFAULT_ADMIN_STATUS_STR;
             string mtu = DEFAULT_MTU_STR;
             string learn_mode;
@@ -268,6 +274,13 @@ void TeamMgr::doLagTask(Consumer &consumer)
                     fallback = fvValue(i) == "true";
                     SWSS_LOG_INFO("Get fallback option %s",
                             fallback ? "true" : "false");
+                }
+                else if (fvField(i) == "fallback_timeout")
+                {
+                    fallback_timeout = static_cast<uint16_t>(stoi(fvValue(i)));
+                    fallback_timeout_set = true;
+                    SWSS_LOG_INFO("Get fallback_timeout value %u",
+                            fallback_timeout);
                 }
                 else if (fvField(i) == "admin_status")
                 {
@@ -297,6 +310,13 @@ void TeamMgr::doLagTask(Consumer &consumer)
                     SWSS_LOG_INFO("Get fast_rate `%s`",
                                   fast_rate ? "true" : "false");
                 }
+                else if (fvField(i) == "active")
+                {
+                    active = fvValue(i) == "true";
+                    active_present = true;
+                    SWSS_LOG_INFO("Get active `%s`",
+                                  active ? "true" : "false");
+                }
                 else if (fvField(i) == "system_mac")
                 {
                     sys_mac = fvValue(i);
@@ -304,9 +324,16 @@ void TeamMgr::doLagTask(Consumer &consumer)
                 }
             }
 
+            if (fallback_timeout_set && !fallback)
+            {
+                SWSS_LOG_WARN("Ignoring fallback_timeout on %s, fallback is not enabled",
+                        alias.c_str());
+                fallback_timeout = DEFAULT_LACP_FALLBACK_TIMEOUT;
+            }
+
             if (m_lagList.find(alias) == m_lagList.end())
             {
-                if (addLag(alias, min_links, fallback, fast_rate) == task_need_retry)
+                if (addLag(alias, min_links, fallback, fallback_timeout, fast_rate, active) == task_need_retry)
                 {
                     // If LAG creation fails, we need to clean up any potentially orphaned teamd processes
                     removeLag(alias);
@@ -315,6 +342,29 @@ void TeamMgr::doLagTask(Consumer &consumer)
                 }
 
                 m_lagList.insert(alias);
+                m_lagActive[alias] = active;
+            }
+            else if (active_present)
+            {
+                bool cur_active = true;
+                auto active_it = m_lagActive.find(alias);
+                if (active_it != m_lagActive.end())
+                {
+                    cur_active = active_it->second;
+                }
+
+                if (active != cur_active)
+                {
+                    removeLag(alias);
+                    m_lagList.erase(alias);
+                    if (addLag(alias, min_links, fallback, fallback_timeout, fast_rate, active) == task_need_retry)
+                    {
+                        it++;
+                        continue;
+                    }
+                    m_lagList.insert(alias);
+                    m_lagActive[alias] = active;
+                }
             }
 
             setLagAdminStatus(alias, admin_status);
@@ -347,6 +397,7 @@ void TeamMgr::doLagTask(Consumer &consumer)
             {
                 removeLag(alias);
                 m_lagList.erase(alias);
+                m_lagActive.erase(alias);
             }
         }
 
@@ -680,7 +731,8 @@ bool TeamMgr::setLagSysmac(const string &alias, string &sys_mac)
     return true;
 }
 
-task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fallback, bool fast_rate)
+task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fallback,
+        uint16_t fallback_timeout, bool fast_rate, bool active)
 {
     SWSS_LOG_ENTER();
 
@@ -724,7 +776,7 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
     conf << "'{\"device\":\"" << alias << "\","
          << "\"hwaddr\":\"" << mac_boot.to_string() << "\","
          << "\"runner\":{"
-         << "\"active\":true,"
+         << "\"active\":" << (active ? "true" : "false") << ","
          << "\"name\":\"lacp\"";
 
     if (min_links != 0)
@@ -735,6 +787,7 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
     if (fallback)
     {
         conf << ",\"fallback\":true";
+        conf << ",\"fallback_timeout\":" << fallback_timeout;
     }
 
     if (fast_rate)
