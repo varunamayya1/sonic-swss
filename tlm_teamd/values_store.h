@@ -52,6 +52,7 @@ private:
         { "runner.fallback",             ValuesStore::json_type::boolean },
         { "runner.fallback_timeout",     ValuesStore::json_type::integer },
         { "runner.fast_rate",            ValuesStore::json_type::boolean },
+        { "runner.min_ports",            ValuesStore::json_type::integer },
         { "team_device.ifinfo.dev_addr", ValuesStore::json_type::string  },
         { "team_device.ifinfo.ifindex",  ValuesStore::json_type::integer },
     };

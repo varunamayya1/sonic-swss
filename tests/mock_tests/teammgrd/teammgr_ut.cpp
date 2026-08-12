@@ -2,16 +2,38 @@
 #include "../mock_table.h"
 #include "teammgr.h"
 #include <dlfcn.h>
+#include <map>
 #include <net/if.h>
 #include <netlink/addr.h>
 #include <netlink/netlink.h>
 #include <netlink/route/link.h>
 #include <netlink/socket.h>
+#include <set>
+#include <unistd.h>
 
 extern int (*callback)(const std::string &cmd, std::string &stdout);
 extern std::vector<std::string> mockCallArgs;
 static std::vector< std::pair<pid_t, int> > mockKillCommands;
-static std::map<std::string, std::FILE*> pidFiles;
+/* In-memory pid file contents. Each fopen gets a fresh tmpfile copy so
+ * ifstream fclose cannot invalidate later opens (unlike a cached FILE*). */
+static std::map<std::string, std::string> pidFileContents;
+static std::set<std::string> missingPidFiles;
+static std::set<pid_t> mockAlivePids;
+
+static void writeMockPidFile(const std::string &alias, pid_t pid)
+{
+    const std::string path = "/var/run/teamd/" + alias + ".pid";
+    missingPidFiles.erase(path);
+    pidFileContents[path] = std::to_string(pid);
+    mockAlivePids.insert(pid);
+}
+
+static void markMockPidMissing(const std::string &alias)
+{
+    const std::string path = "/var/run/teamd/" + alias + ".pid";
+    pidFileContents.erase(path);
+    missingPidFiles.insert(path);
+}
 
 static int (*callback_kill)(pid_t pid, int sig) = NULL;
 static std::pair<bool, FILE*> (*callback_fopen)(const char *pathname, const char *mode) = NULL;
@@ -114,13 +136,18 @@ static int cb_kill(pid_t pid, int sig)
     mockKillCommands.push_back(std::make_pair(pid, sig));
     if (!sig)
     {
+        if (mockAlivePids.find(pid) != mockAlivePids.end())
+        {
+            return 0;
+        }
         errno = ESRCH;
         return -1;
     }
-    else
+    if (sig == SIGTERM || sig == SIGKILL)
     {
-        return 0;
+        mockAlivePids.erase(pid);
     }
+    return 0;
 }
 
 int kill(pid_t pid, int sig)
@@ -136,19 +163,38 @@ int kill(pid_t pid, int sig)
 
 static std::pair<bool, FILE*> cb_fopen(const char *pathname, const char *mode)
 {
-    auto pidFileSearch = pidFiles.find(pathname);
-    if (pidFileSearch != pidFiles.end())
+    if (missingPidFiles.find(pathname) != missingPidFiles.end())
     {
-        if (!pidFileSearch->second)
+        errno = ENOENT;
+        return std::make_pair(true, (FILE*)NULL);
+    }
+    auto it = pidFileContents.find(pathname);
+    if (it != pidFileContents.end())
+    {
+        FILE *pidFile = std::tmpfile();
+        if (!pidFile)
         {
             errno = ENOENT;
+            return std::make_pair(true, (FILE*)NULL);
         }
-        return std::make_pair(true, pidFileSearch->second);
+        std::fputs(it->second.c_str(), pidFile);
+        std::rewind(pidFile);
+        return std::make_pair(true, pidFile);
     }
-    else
+    return std::make_pair(false, (FILE*)NULL);
+}
+
+int unlink(const char *pathname)
+{
+    if (missingPidFiles.find(pathname) != missingPidFiles.end() ||
+        pidFileContents.find(pathname) != pidFileContents.end())
     {
-        return std::make_pair(false, (FILE*)NULL);
+        pidFileContents.erase(pathname);
+        return 0;
     }
+    int (*realfunc)(const char *) =
+        (int (*)(const char *))(dlsym(RTLD_NEXT, "unlink"));
+    return realfunc(pathname);
 }
 
 // On 32-bit architectures, if 64-bit file offsets/support for large files is
@@ -189,32 +235,54 @@ FILE* fopen64(const char *pathname, const char *mode)
 int cb(const std::string &cmd, std::string &stdout)
 {
     mockCallArgs.push_back(cmd);
+    if (cmd.find("state item set") != std::string::npos &&
+        cmd.find("PortChannel705") != std::string::npos)
+    {
+        return 1;
+    }
     if (cmd.find("/usr/bin/teamd -r -t PortChannel382") != std::string::npos)
     {
-        mkdir("/var/run/teamd", 0755);
-        std::FILE* pidFile = std::tmpfile();
-        std::fputs("1234", pidFile);
-        std::rewind(pidFile);
-        pidFiles["/var/run/teamd/PortChannel382.pid"] = pidFile;
+        writeMockPidFile("PortChannel382", 1234);
         return 1;
     }
     else if (cmd.find("/usr/bin/teamd -r -t PortChannel812") != std::string::npos)
     {
-        pidFiles["/var/run/teamd/PortChannel812.pid"] = NULL;
+        markMockPidMissing("PortChannel812");
         return 1;
     }
     else if (cmd.find("/usr/bin/teamd -r -t PortChannel495") != std::string::npos)
     {
-        mkdir("/var/run/teamd", 0755);
-        std::FILE* pidFile = std::tmpfile();
-        std::fputs("5678", pidFile);
-        std::rewind(pidFile);
-        pidFiles["/var/run/teamd/PortChannel495.pid"] = pidFile;
+        writeMockPidFile("PortChannel495", 5678);
         return 0;
     }
     else if (cmd.find("/usr/bin/teamd -r -t PortChannel198") != std::string::npos)
     {
-        pidFiles["/var/run/teamd/PortChannel198.pid"] = NULL;
+        markMockPidMissing("PortChannel198");
+    }
+    else if (cmd.find("/usr/bin/teamd -r -t PortChannel704") != std::string::npos ||
+             cmd.find("/usr/bin/teamd -r -t PortChannel705") != std::string::npos ||
+             cmd.find("/usr/bin/teamd -r -t PortChannel806") != std::string::npos ||
+             cmd.find("/usr/bin/teamd -r -t PortChannel807") != std::string::npos)
+    {
+        std::string alias = "PortChannel704";
+        pid_t pid = 7777;
+        if (cmd.find("PortChannel705") != std::string::npos)
+        {
+            alias = "PortChannel705";
+            pid = 7778;
+        }
+        else if (cmd.find("PortChannel806") != std::string::npos)
+        {
+            alias = "PortChannel806";
+            pid = 7779;
+        }
+        else if (cmd.find("PortChannel807") != std::string::npos)
+        {
+            alias = "PortChannel807";
+            pid = 7780;
+        }
+        writeMockPidFile(alias, pid);
+        return 0;
     }
     else
     {
@@ -222,7 +290,7 @@ int cb(const std::string &cmd, std::string &stdout)
         {
             if (cmd.find(std::string("/usr/bin/teamd -r -t PortChannel") + std::to_string(i)) != std::string::npos)
             {
-                pidFiles[std::string("/var/run/teamd/PortChannel") + std::to_string(i) + std::string(".pid")] = NULL;
+                markMockPidMissing(std::string("PortChannel") + std::to_string(i));
             }
         }
     }
@@ -263,7 +331,9 @@ namespace teammgr_ut
             cfg_lag_tables = tables;
             mockCallArgs.clear();
             mockKillCommands.clear();
-            pidFiles.clear();
+            mockAlivePids.clear();
+            missingPidFiles.clear();
+            pidFileContents.clear();
             mock_nl_socket_alloc_fail = false;
             mock_nl_connect_result = 0;
             mock_rtnl_link_alloc_fail = false;
@@ -297,10 +367,13 @@ namespace teammgr_ut
         teammgr.doTask();
         ASSERT_NE(mockCallArgs.size(), 0);
         EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel382"), std::string::npos);
-        EXPECT_EQ(mockCallArgs.size(), 1);
-        EXPECT_EQ(mockKillCommands.size(), 1);
+        EXPECT_EQ(mockCallArgs.size(), 2);
+        EXPECT_NE(mockCallArgs.back().find("link delete"), std::string::npos);
+        EXPECT_EQ(mockKillCommands.size(), 2);
         EXPECT_EQ(mockKillCommands.front().first, 1234);
         EXPECT_EQ(mockKillCommands.front().second, SIGTERM);
+        EXPECT_EQ(mockKillCommands.back().first, 1234);
+        EXPECT_EQ(mockKillCommands.back().second, 0);
     }
 
     TEST_F(TeamMgrTest, testProcessPidFileMissingAfterAddLagFailure)
@@ -316,7 +389,8 @@ namespace teammgr_ut
         teammgr.doTask();
         ASSERT_NE(mockCallArgs.size(), 0);
         EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel812"), std::string::npos);
-        EXPECT_EQ(mockCallArgs.size(), 1);
+        EXPECT_EQ(mockCallArgs.size(), 2);
+        EXPECT_NE(mockCallArgs.back().find("link delete"), std::string::npos);
         EXPECT_EQ(mockKillCommands.size(), 0);
     }
 
@@ -330,7 +404,8 @@ namespace teammgr_ut
                                             { "min_links", "2" } });
         teammgr.addExistingData(&cfg_lag_table);
         teammgr.doTask();
-        ASSERT_EQ(mockCallArgs.size(), 3);
+        // teamd + ip link show (ready wait) + admin + mtu
+        ASSERT_EQ(mockCallArgs.size(), 4);
         ASSERT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel495"), std::string::npos);
         teammgr.cleanTeamProcesses();
         EXPECT_EQ(mockKillCommands.size(), 2);
@@ -351,7 +426,8 @@ namespace teammgr_ut
         teammgr.doTask();
         ASSERT_NE(mockCallArgs.size(), 0);
         EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel198"), std::string::npos);
-        EXPECT_EQ(mockCallArgs.size(), 3);
+        // teamd + ip link show (ready wait) + admin + mtu
+        EXPECT_EQ(mockCallArgs.size(), 4);
         teammgr.cleanTeamProcesses();
         EXPECT_EQ(mockKillCommands.size(), 0);
     }
@@ -405,6 +481,269 @@ namespace teammgr_ut
         EXPECT_EQ(mockCallArgs.front().find("\"fallback_timeout\""), std::string::npos);
     }
 
+    TEST_F(TeamMgrTest, testRuntimeRunnerAttrHotUpdate)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel704", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "fallback", "false" },
+                                            { "fast_rate", "false" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel704"), std::string::npos);
+
+        size_t calls_after_create = mockCallArgs.size();
+        mockKillCommands.clear();
+
+        cfg_lag_table.set("PortChannel704", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "2" },
+                                            { "fallback", "true" },
+                                            { "fallback_timeout", "120" },
+                                            { "fast_rate", "true" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        bool saw_min_ports = false;
+        bool saw_fallback = false;
+        bool saw_timeout = false;
+        bool saw_fast_rate = false;
+        bool saw_recreate = false;
+        for (size_t i = calls_after_create; i < mockCallArgs.size(); i++)
+        {
+            const auto &cmd = mockCallArgs[i];
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("\"runner.min_ports\"") != std::string::npos &&
+                cmd.find("\"2\"") != std::string::npos)
+            {
+                saw_min_ports = true;
+            }
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("\"runner.fallback\"") != std::string::npos &&
+                cmd.find("\"true\"") != std::string::npos)
+            {
+                saw_fallback = true;
+            }
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("\"runner.fallback_timeout\"") != std::string::npos &&
+                cmd.find("\"120\"") != std::string::npos)
+            {
+                saw_timeout = true;
+            }
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("\"runner.fast_rate\"") != std::string::npos &&
+                cmd.find("\"true\"") != std::string::npos)
+            {
+                saw_fast_rate = true;
+            }
+            if (cmd.find("/usr/bin/teamd -r -t PortChannel704") != std::string::npos)
+            {
+                saw_recreate = true;
+            }
+        }
+
+        EXPECT_TRUE(saw_min_ports);
+        EXPECT_TRUE(saw_fallback);
+        EXPECT_TRUE(saw_timeout);
+        EXPECT_TRUE(saw_fast_rate);
+        EXPECT_FALSE(saw_recreate);
+        // isTeamdRunning() probes with kill(pid, 0); no SIGTERM on hot-update success
+        ASSERT_EQ(mockKillCommands.size(), 1);
+        EXPECT_EQ(mockKillCommands.front().second, 0);
+    }
+
+    TEST_F(TeamMgrTest, testFallbackTogglePreservesTimeoutForHotUpdate)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel806", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "fallback", "false" },
+                                            { "fast_rate", "false" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel806"), std::string::npos);
+
+        size_t calls_after_create = mockCallArgs.size();
+        mockKillCommands.clear();
+
+        cfg_lag_table.set("PortChannel806", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "fallback", "true" },
+                                            { "fallback_timeout", "30" },
+                                            { "fast_rate", "false" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        bool saw_timeout_30 = false;
+        for (size_t i = calls_after_create; i < mockCallArgs.size(); i++)
+        {
+            const auto &cmd = mockCallArgs[i];
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("\"runner.fallback_timeout\"") != std::string::npos &&
+                cmd.find("\"30\"") != std::string::npos)
+            {
+                saw_timeout_30 = true;
+            }
+        }
+        EXPECT_TRUE(saw_timeout_30);
+
+        calls_after_create = mockCallArgs.size();
+        mockKillCommands.clear();
+
+        cfg_lag_table.set("PortChannel806", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "fallback", "false" },
+                                            { "fast_rate", "false" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        calls_after_create = mockCallArgs.size();
+        mockKillCommands.clear();
+
+        cfg_lag_table.set("PortChannel806", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "fallback", "true" },
+                                            { "fallback_timeout", "90" },
+                                            { "fast_rate", "false" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        bool saw_timeout_90 = false;
+        for (size_t i = calls_after_create; i < mockCallArgs.size(); i++)
+        {
+            const auto &cmd = mockCallArgs[i];
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("\"runner.fallback_timeout\"") != std::string::npos &&
+                cmd.find("\"90\"") != std::string::npos)
+            {
+                saw_timeout_90 = true;
+            }
+        }
+        EXPECT_TRUE(saw_timeout_90);
+        // isTeamdRunning() probes only; fallback toggle must not recreate
+        for (const auto &k : mockKillCommands)
+        {
+            EXPECT_EQ(k.second, 0);
+        }
+    }
+
+    TEST_F(TeamMgrTest, testRuntimeRunnerAttrHotUpdateFailureRecreates)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel705", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel705"), std::string::npos);
+
+        size_t calls_after_create = mockCallArgs.size();
+        mockKillCommands.clear();
+
+        cfg_lag_table.set("PortChannel705", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "3" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        bool saw_hot_update = false;
+        bool saw_recreate = false;
+        for (size_t i = calls_after_create; i < mockCallArgs.size(); i++)
+        {
+            const auto &cmd = mockCallArgs[i];
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("runner.min_ports") != std::string::npos)
+            {
+                saw_hot_update = true;
+            }
+            if (cmd.find("/usr/bin/teamd -r -t PortChannel705") != std::string::npos)
+            {
+                saw_recreate = true;
+            }
+        }
+
+        EXPECT_TRUE(saw_hot_update);
+        EXPECT_TRUE(saw_recreate);
+        // isTeamdRunning probe + SIGTERM + exit probe (+ optional addLag ready probe)
+        ASSERT_GE(mockKillCommands.size(), 3u);
+        EXPECT_EQ(mockKillCommands[0].second, 0);
+        EXPECT_EQ(mockKillCommands[1].second, SIGTERM);
+        EXPECT_EQ(mockKillCommands[2].second, 0);
+        for (size_t i = 3; i < mockKillCommands.size(); i++)
+        {
+            EXPECT_EQ(mockKillCommands[i].second, 0);
+        }
+    }
+
+    TEST_F(TeamMgrTest, testActiveModeHotUpdateDoesNotRecreate)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel807", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "active", "true" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel807"), std::string::npos);
+
+        size_t calls_after_create = mockCallArgs.size();
+        mockKillCommands.clear();
+
+        cfg_lag_table.set("PortChannel807", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "active", "false" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        bool saw_active_set = false;
+        bool saw_recreate = false;
+        for (size_t i = calls_after_create; i < mockCallArgs.size(); i++)
+        {
+            const auto &cmd = mockCallArgs[i];
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("\"runner.active\"") != std::string::npos &&
+                cmd.find("\"false\"") != std::string::npos)
+            {
+                saw_active_set = true;
+            }
+            if (cmd.find("/usr/bin/teamd -r -t PortChannel807") != std::string::npos)
+            {
+                saw_recreate = true;
+            }
+        }
+
+        EXPECT_TRUE(saw_active_set);
+        EXPECT_FALSE(saw_recreate);
+        for (const auto &k : mockKillCommands)
+        {
+            EXPECT_EQ(k.second, 0);
+        }
+    }
+
     TEST_F(TeamMgrTest, testSleepDuringCleanup)
     {
         swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
@@ -417,7 +756,8 @@ namespace teammgr_ut
         }
         teammgr.addExistingData(&cfg_lag_table);
         teammgr.doTask();
-        ASSERT_EQ(mockCallArgs.size(), 60);
+        // 20 lags * (teamd + ip link show + admin + mtu)
+        ASSERT_EQ(mockCallArgs.size(), 80);
         std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
         teammgr.cleanTeamProcesses();
         std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();

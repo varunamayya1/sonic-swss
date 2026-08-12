@@ -19,6 +19,8 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <signal.h>
+#include <errno.h>
+#include <unistd.h>
 #include <netlink/route/link.h>
 
 
@@ -248,10 +250,13 @@ void TeamMgr::doLagTask(Consumer &consumer)
         if (op == SET_COMMAND)
         {
             int min_links = 0;
+            bool min_links_present = false;
             bool fallback = false;
+            bool fallback_present = false;
             bool fallback_timeout_set = false;
             uint16_t fallback_timeout = DEFAULT_LACP_FALLBACK_TIMEOUT;
             bool fast_rate = false;
+            bool fast_rate_present = false;
             bool active = true;
             bool active_present = false;
             string admin_status = DEFAULT_ADMIN_STATUS_STR;
@@ -260,18 +265,29 @@ void TeamMgr::doLagTask(Consumer &consumer)
             string tpid;
             string sys_mac;
 
-            for (auto i : kfvFieldsValues(t))
+            /* gNMI / CONFIG may notify with only the changed leaf (e.g. active).
+             * Read the full PORTCHANNEL entry so other runner attrs are not
+             * treated as defaults and incorrectly hot-updated or recreated. */
+            vector<FieldValueTuple> cfg_fvs;
+            m_cfgLagTable.get(alias, cfg_fvs);
+            vector<FieldValueTuple> fvs = cfg_fvs;
+            if (fvs.empty())
             {
-                // min_links and fallback attributes cannot be changed
-                // after the LAG is created.
+                fvs = kfvFieldsValues(t);
+            }
+
+            for (auto i : fvs)
+            {
                 if (fvField(i) == "min_links")
                 {
                     min_links = stoi(fvValue(i));
+                    min_links_present = true;
                     SWSS_LOG_INFO("Get min_links value %d", min_links);
                 }
                 else if (fvField(i) == "fallback")
                 {
                     fallback = fvValue(i) == "true";
+                    fallback_present = true;
                     SWSS_LOG_INFO("Get fallback option %s",
                             fallback ? "true" : "false");
                 }
@@ -307,6 +323,7 @@ void TeamMgr::doLagTask(Consumer &consumer)
                 else if (fvField(i) == "fast_rate")
                 {
                     fast_rate = fvValue(i) == "true";
+                    fast_rate_present = true;
                     SWSS_LOG_INFO("Get fast_rate `%s`",
                                   fast_rate ? "true" : "false");
                 }
@@ -324,12 +341,47 @@ void TeamMgr::doLagTask(Consumer &consumer)
                 }
             }
 
-            if (fallback_timeout_set && !fallback)
+            if (!fallback_timeout_set)
+            {
+                auto attrs_it = m_lagRunnerAttrs.find(alias);
+                if (attrs_it != m_lagRunnerAttrs.end())
+                {
+                    fallback_timeout = attrs_it->second.fallback_timeout;
+                }
+            }
+
+            /* If this notification omitted runner fields, keep the last applied
+             * values so a lacp-mode-only SET cannot reset fallback/fast_rate. */
+            auto cur_attrs_it = m_lagRunnerAttrs.find(alias);
+            if (cur_attrs_it != m_lagRunnerAttrs.end())
+            {
+                if (!min_links_present)
+                {
+                    min_links = cur_attrs_it->second.min_links;
+                }
+                if (!fallback_present)
+                {
+                    fallback = cur_attrs_it->second.fallback;
+                }
+                if (!fallback_timeout_set)
+                {
+                    fallback_timeout = cur_attrs_it->second.fallback_timeout;
+                }
+                if (!fast_rate_present)
+                {
+                    fast_rate = cur_attrs_it->second.fast_rate;
+                }
+            }
+
+            if (fallback_timeout_set && fallback_present && !fallback)
             {
                 SWSS_LOG_WARN("Ignoring fallback_timeout on %s, fallback is not enabled",
                         alias.c_str());
                 fallback_timeout = DEFAULT_LACP_FALLBACK_TIMEOUT;
             }
+
+            LagRunnerAttrs runner_attrs{min_links, fallback, fallback_timeout, fast_rate};
+            bool need_recreate = false;
 
             if (m_lagList.find(alias) == m_lagList.end())
             {
@@ -343,32 +395,110 @@ void TeamMgr::doLagTask(Consumer &consumer)
 
                 m_lagList.insert(alias);
                 m_lagActive[alias] = active;
+                m_lagRunnerAttrs[alias] = runner_attrs;
             }
-            else if (active_present)
+            else
             {
-                bool cur_active = true;
-                auto active_it = m_lagActive.find(alias);
-                if (active_it != m_lagActive.end())
+                // Force recreate only when teamd is gone and the netdev is gone.
+                // A missing pid with a live device is treated as still present.
+                if (!isTeamdRunning(alias))
                 {
-                    cur_active = active_it->second;
+                    stringstream show_cmd;
+                    string show_res;
+                    show_cmd << IP_CMD << " link show " << shellquote(alias);
+                    if (exec(show_cmd.str(), show_res) != 0)
+                    {
+                        SWSS_LOG_WARN("teamd for %s is not running, recreating LAG",
+                                alias.c_str());
+                        need_recreate = true;
+                    }
                 }
 
-                if (active != cur_active)
+                if (active_present)
                 {
+                    bool cur_active = true;
+                    auto active_it = m_lagActive.find(alias);
+                    if (active_it != m_lagActive.end())
+                    {
+                        cur_active = active_it->second;
+                    }
+
+                    if (active != cur_active)
+                    {
+                        // lacp-mode must not recreate the LAG; retry on failure.
+                        if (!setLagRunnerAttr(alias, "runner.active",
+                                             active ? "true" : "false"))
+                        {
+                            SWSS_LOG_ERROR("Failed to hot-update active on %s, will retry",
+                                    alias.c_str());
+                            it++;
+                            continue;
+                        }
+                        m_lagActive[alias] = active;
+                    }
+                }
+
+                bool runner_changed = (cur_attrs_it == m_lagRunnerAttrs.end()) ||
+                    cur_attrs_it->second.min_links != runner_attrs.min_links ||
+                    cur_attrs_it->second.fallback != runner_attrs.fallback ||
+                    cur_attrs_it->second.fallback_timeout != runner_attrs.fallback_timeout ||
+                    cur_attrs_it->second.fast_rate != runner_attrs.fast_rate;
+
+                if (!need_recreate && runner_changed)
+                {
+                    if (!setLagRunnerAttrs(alias, runner_attrs))
+                    {
+                        SWSS_LOG_WARN("Failed to hot-update runner attrs on %s, recreating LAG",
+                                alias.c_str());
+                        need_recreate = true;
+                    }
+                    else
+                    {
+                        m_lagRunnerAttrs[alias] = runner_attrs;
+                    }
+                }
+
+                if (need_recreate)
+                {
+                    bool recreate_active = active;
+                    if (!active_present)
+                    {
+                        auto active_it = m_lagActive.find(alias);
+                        if (active_it != m_lagActive.end())
+                        {
+                            recreate_active = active_it->second;
+                        }
+                    }
+
                     removeLag(alias);
                     m_lagList.erase(alias);
-                    if (addLag(alias, min_links, fallback, fallback_timeout, fast_rate, active) == task_need_retry)
+                    m_lagActive.erase(alias);
+                    m_lagRunnerAttrs.erase(alias);
+                    if (addLag(alias, min_links, fallback, fallback_timeout, fast_rate, recreate_active) == task_need_retry)
                     {
+                        removeLag(alias);
                         it++;
                         continue;
                     }
                     m_lagList.insert(alias);
-                    m_lagActive[alias] = active;
+                    m_lagActive[alias] = recreate_active;
+                    m_lagRunnerAttrs[alias] = runner_attrs;
+                    resyncLagMembers(alias);
                 }
             }
 
-            setLagAdminStatus(alias, admin_status);
-            setLagMtu(alias, mtu);
+            // Do not throw on transient "device does not exist" after recreate —
+            // retry the SET until the team netdev is ready.
+            if (!setLagAdminStatus(alias, admin_status))
+            {
+                it++;
+                continue;
+            }
+            if (!setLagMtu(alias, mtu))
+            {
+                it++;
+                continue;
+            }
             if (!learn_mode.empty())
             {
                 setLagLearnMode(alias, learn_mode);
@@ -398,6 +528,7 @@ void TeamMgr::doLagTask(Consumer &consumer)
                 removeLag(alias);
                 m_lagList.erase(alias);
                 m_lagActive.erase(alias);
+                m_lagRunnerAttrs.erase(alias);
             }
         }
 
@@ -481,6 +612,24 @@ bool TeamMgr::isPortEnslaved(const string &port)
     return lstat(path.c_str(), &buf) == 0;
 }
 
+bool TeamMgr::isLagMemberInTeamd(const string &lag, const string &member)
+{
+    SWSS_LOG_ENTER();
+
+    stringstream cmd;
+    string res;
+
+    cmd << TEAMDCTL_CMD << " " << shellquote(lag) << " state dump";
+    if (exec(cmd.str(), res) != 0)
+    {
+        SWSS_LOG_INFO("Failed to get teamd state for %s: %s", lag.c_str(), res.c_str());
+        return false;
+    }
+
+    const string needle = "\"" + member + "\"";
+    return res.find(needle) != string::npos;
+}
+
 bool TeamMgr::findPortMaster(string &master, const string &port)
 {
     SWSS_LOG_ENTER();
@@ -558,7 +707,12 @@ bool TeamMgr::setLagAdminStatus(const string &alias, const string &admin_status)
 
     // ip link set dev <port_channel_name> [up|down]
     cmd << IP_CMD << " link set dev " << shellquote(alias) << " " << shellquote(admin_status);
-    EXEC_WITH_ERROR_THROW(cmd.str(), res);
+    if (exec(cmd.str(), res) != 0)
+    {
+        SWSS_LOG_INFO("Failed to set port channel %s admin status to %s: %s",
+                alias.c_str(), admin_status.c_str(), res.c_str());
+        return false;
+    }
 
     SWSS_LOG_NOTICE("Set port channel %s admin status to %s",
             alias.c_str(), admin_status.c_str());
@@ -575,7 +729,12 @@ bool TeamMgr::setLagMtu(const string &alias, const string &mtu)
 
     // ip link set dev <port_channel_name> mtu <mtu_value>
     cmd << IP_CMD << " link set dev " << shellquote(alias) << " mtu " << shellquote(mtu);
-    EXEC_WITH_ERROR_THROW(cmd.str(), res);
+    if (exec(cmd.str(), res) != 0)
+    {
+        SWSS_LOG_INFO("Failed to set port channel %s mtu to %s: %s",
+                alias.c_str(), mtu.c_str(), res.c_str());
+        return false;
+    }
 
     vector<FieldValueTuple> fvs;
     FieldValueTuple fv("mtu", mtu);
@@ -613,6 +772,82 @@ bool TeamMgr::setLagTpid(const string &alias, const string &tpid)
     m_appLagTable.set(alias, fvs);
 
     SWSS_LOG_NOTICE("Set port channel %s TPID to %s", alias.c_str(), tpid.c_str());
+
+    return true;
+}
+
+bool TeamMgr::setLagRunnerAttr(const string &alias, const string &item_path,
+                               const string &value)
+{
+    SWSS_LOG_ENTER();
+
+    stringstream cmd;
+    string res;
+
+    // teamdctl <lag> state item set <path> <value>
+    cmd << TEAMDCTL_CMD << " " << shellquote(alias)
+        << " state item set " << shellquote(item_path) << " " << shellquote(value);
+
+    if (exec(cmd.str(), res) != 0)
+    {
+        SWSS_LOG_ERROR("Failed to set %s=%s on port channel %s: %s",
+                item_path.c_str(), value.c_str(), alias.c_str(), res.c_str());
+        return false;
+    }
+
+    SWSS_LOG_NOTICE("Set %s=%s on port channel %s",
+            item_path.c_str(), value.c_str(), alias.c_str());
+    return true;
+}
+
+bool TeamMgr::setLagRunnerAttrs(const string &alias, const LagRunnerAttrs &attrs)
+{
+    SWSS_LOG_ENTER();
+
+    LagRunnerAttrs cur{};
+    auto it = m_lagRunnerAttrs.find(alias);
+    if (it != m_lagRunnerAttrs.end())
+    {
+        cur = it->second;
+    }
+
+    if (attrs.min_links != cur.min_links)
+    {
+        // teamd defaults min_ports to 1 when unset (0) at create time.
+        int min_ports = attrs.min_links != 0 ? attrs.min_links : 1;
+        if (!setLagRunnerAttr(alias, "runner.min_ports", to_string(min_ports)))
+        {
+            return false;
+        }
+    }
+
+    if (attrs.fallback != cur.fallback)
+    {
+        if (!setLagRunnerAttr(alias, "runner.fallback", attrs.fallback ? "true" : "false"))
+        {
+            return false;
+        }
+    }
+
+    /* Re-enabling fallback must (re)apply the timeout even when the cached value
+     * already matches CONFIG, because disabling fallback does not change teamd's
+     * stored timeout and a stale cache entry can otherwise skip the update. */
+    if (attrs.fallback && (!cur.fallback || attrs.fallback_timeout != cur.fallback_timeout))
+    {
+        if (!setLagRunnerAttr(alias, "runner.fallback_timeout",
+                              to_string(attrs.fallback_timeout)))
+        {
+            return false;
+        }
+    }
+
+    if (attrs.fast_rate != cur.fast_rate)
+    {
+        if (!setLagRunnerAttr(alias, "runner.fast_rate", attrs.fast_rate ? "true" : "false"))
+        {
+            return false;
+        }
+    }
 
     return true;
 }
@@ -816,36 +1051,128 @@ task_process_status TeamMgr::addLag(const string &alias, int min_links, bool fal
         return task_need_retry;
     }
 
-    SWSS_LOG_NOTICE("Start port channel %s with teamd", alias.c_str());
+    // teamd -d returns as soon as the daemon forks; wait until the netdev
+    // exists so setLagAdminStatus/setLagMtu do not race with device creation.
+    for (int attempt = 0; attempt < 100; attempt++)
+    {
+        stringstream show_cmd;
+        string show_res;
+        show_cmd << IP_CMD << " link show " << shellquote(alias);
+        if (exec(show_cmd.str(), show_res) == 0)
+        {
+            SWSS_LOG_NOTICE("Start port channel %s with teamd", alias.c_str());
+            return task_success;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
 
-    return task_success;
+    SWSS_LOG_INFO("Port channel %s teamd started but device not ready, retry...",
+            alias.c_str());
+    return task_need_retry;
+}
+
+bool TeamMgr::isTeamdRunning(const string &alias)
+{
+    SWSS_LOG_ENTER();
+
+    pid_t pid;
+    ifstream pidfile("/var/run/teamd/" + alias + ".pid");
+    if (!pidfile.is_open())
+    {
+        return false;
+    }
+
+    pidfile >> pid;
+    if (pid <= 0)
+    {
+        return false;
+    }
+
+    return kill(pid, 0) == 0;
 }
 
 bool TeamMgr::removeLag(const string &alias)
 {
     SWSS_LOG_ENTER();
 
-    pid_t pid;
+    pid_t pid = 0;
+    bool have_pid = false;
 
     {
         ifstream pidfile("/var/run/teamd/" + alias + ".pid");
         if (pidfile.is_open())
         {
             pidfile >> pid;
+            have_pid = (pid > 0);
             SWSS_LOG_INFO("Read port channel %s pid %d", alias.c_str(), pid);
         }
         else
         {
             SWSS_LOG_NOTICE("Failed to remove non-existent port channel %s pid...", alias.c_str());
-            return false;
         }
     }
 
-    if (kill(pid, SIGTERM))
+    if (have_pid)
     {
-        SWSS_LOG_ERROR("Failed to send SIGTERM to port channel %s pid %d: %s", alias.c_str(), pid, strerror(errno));
-        return false;
+        if (kill(pid, SIGTERM) && errno != ESRCH)
+        {
+            SWSS_LOG_ERROR("Failed to send SIGTERM to port channel %s pid %d: %s",
+                    alias.c_str(), pid, strerror(errno));
+            return false;
+        }
+
+        // Wait for teamd to exit; escalate to SIGKILL on timeout so teammgrd
+        // cannot block forever with STATE already cleared by RTM_DELLINK.
+        const int max_wait_ms = 2000;
+        int waited_ms = 0;
+        while (kill(pid, 0) == 0)
+        {
+            if (waited_ms >= max_wait_ms)
+            {
+                SWSS_LOG_WARN("Port channel %s pid %d did not exit after SIGTERM, sending SIGKILL",
+                        alias.c_str(), pid);
+                kill(pid, SIGKILL);
+                waited_ms = 0;
+                while (kill(pid, 0) == 0 && waited_ms < max_wait_ms)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    waited_ms += 10;
+                }
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            waited_ms += 10;
+        }
     }
+
+    const string pid_path = "/var/run/teamd/" + alias + ".pid";
+    if (unlink(pid_path.c_str()) && errno != ENOENT)
+    {
+        SWSS_LOG_WARN("Failed to remove pid file %s: %s",
+                pid_path.c_str(), strerror(errno));
+    }
+
+    // Detach any members still enslaved to this LAG before deleting the device.
+    vector<string> keys;
+    m_cfgLagMemberTable.getKeys(keys);
+    for (const auto &key : keys)
+    {
+        auto tokens = tokenize(key, config_db_key_delimiter);
+        if (tokens.size() < 2 || tokens[0] != alias)
+        {
+            continue;
+        }
+        stringstream detach_cmd;
+        string detach_res;
+        detach_cmd << IP_CMD << " link set dev " << shellquote(tokens[1]) << " nomaster";
+        exec(detach_cmd.str(), detach_res);
+    }
+
+    // Ensure leftover team netdev cannot block the next "teamd -r".
+    stringstream cmd;
+    string res;
+    cmd << IP_CMD << " link delete " << shellquote(alias);
+    exec(cmd.str(), res);
 
     SWSS_LOG_NOTICE("Stop port channel %s", alias.c_str());
 
@@ -859,6 +1186,34 @@ bool TeamMgr::removeLag(const string &alias)
 //                  We are adding 1 at the beginning to avoid LACP key collisions between similar LACP keys e.g. PortChannel10 and PortChannel010.
 //      2. n -      LACP key will be n.
 //      3. "" -     LACP key will be 0 - exists for backward compatibility.
+void TeamMgr::resyncLagMembers(const string &alias)
+{
+    SWSS_LOG_ENTER();
+
+    vector<string> keys;
+    m_cfgLagMemberTable.getKeys(keys);
+
+    for (const auto &key : keys)
+    {
+        auto tokens = tokenize(key, config_db_key_delimiter);
+        if (tokens.size() < 2 || tokens[0] != alias)
+        {
+            continue;
+        }
+
+        const string &member = tokens[1];
+        for (int attempt = 0; attempt < 100; attempt++)
+        {
+            task_process_status rc = addLagMember(alias, member);
+            if (rc != task_need_retry)
+            {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+}
+
 uint16_t TeamMgr::generateLacpKey(const string& lag)
 {
     vector <FieldValueTuple> fvs;
@@ -916,11 +1271,26 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
 	return task_ignore;
     }
 
-    // If port is already enslaved, ignore this operation
+    // If port is already enslaved and teamd knows about it, ignore this operation
     // TODO: check the current master if it is the same as to be configured
-    if (isPortEnslaved(member))
+    if (isPortEnslaved(member) && isLagMemberInTeamd(lag, member))
     {
         return task_ignore;
+    }
+
+    if (isPortEnslaved(member))
+    {
+        SWSS_LOG_NOTICE("Port %s is kernel-enslaved to %s but missing from teamd, detaching before re-add",
+                member.c_str(), lag.c_str());
+        stringstream detach_cmd;
+        string detach_res;
+        detach_cmd << IP_CMD << " link set dev " << shellquote(member) << " nomaster";
+        if (exec(detach_cmd.str(), detach_res) != 0)
+        {
+            SWSS_LOG_INFO("Failed to detach %s from master, retry... (%s)",
+                    member.c_str(), detach_res.c_str());
+            return task_need_retry;
+        }
     }
 
     uint16_t keyId = generateLacpKey(lag);
@@ -946,16 +1316,17 @@ task_process_status TeamMgr::addLagMember(const string &lag, const string &membe
         // member port while adding this port into the port channel. This piece
         // of code will check if the port is set to admin status up. If yes,
         // it will retry to add the port into the port channel.
-        if (checkPortIffUp(member))
+        const bool lag_not_ready = (res.find("does not exist") != string::npos);
+        if (lag_not_ready || checkPortIffUp(member))
         {
-            SWSS_LOG_INFO("Failed to add %s to port channel %s, retry...",
-                    member.c_str(), lag.c_str());
+            SWSS_LOG_INFO("Failed to add %s to port channel %s, retry... (%s)",
+                    member.c_str(), lag.c_str(), res.c_str());
             return task_need_retry;
         }
         else
         {
-            SWSS_LOG_ERROR("Failed to add %s to port channel %s",
-                    member.c_str(), lag.c_str());
+            SWSS_LOG_ERROR("Failed to add %s to port channel %s: %s",
+                    member.c_str(), lag.c_str(), res.c_str());
             return task_failed;
         }
     }

@@ -34,8 +34,17 @@ private:
     ProducerStateTable m_appPortTable;
     ProducerStateTable m_appLagTable;
 
+    struct LagRunnerAttrs
+    {
+        int min_links = 0;
+        bool fallback = false;
+        uint16_t fallback_timeout = 90;
+        bool fast_rate = false;
+    };
+
     std::set<std::string> m_lagList;
     std::map<std::string, bool> m_lagActive;
+    std::map<std::string, LagRunnerAttrs> m_lagRunnerAttrs;
 
     MacAddress m_mac;
 
@@ -55,8 +64,14 @@ private:
     bool setLagLearnMode(const std::string &alias, const std::string &learn_mode);
     bool setLagTpid(const std::string &alias, const std::string &tpid);
     int update_kernel(const std::string &alias, const std::string &system_mac);
+    bool setLagRunnerAttrs(const std::string &alias, const LagRunnerAttrs &attrs);
+    bool setLagRunnerAttr(const std::string &alias, const std::string &item_path,
+                          const std::string &value);
+    void resyncLagMembers(const std::string &alias);
 
     bool isPortEnslaved(const std::string &);
+    bool isLagMemberInTeamd(const std::string &lag, const std::string &member);
+    bool isTeamdRunning(const std::string &alias);
     bool findPortMaster(std::string &, const std::string &);
     bool checkPortIffUp(const std::string &);
     bool isPortStateOk(const std::string&);
