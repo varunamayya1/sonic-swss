@@ -414,7 +414,9 @@ void TeamMgr::doLagTask(Consumer &consumer)
                     }
                 }
 
-                if (active_present)
+                // A recreate starts teamd with the new mode, and teamdctl
+                // cannot reach a teamd that is gone.
+                if (active_present && !need_recreate)
                 {
                     bool cur_active = true;
                     auto active_it = m_lagActive.find(alias);

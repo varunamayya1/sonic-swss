@@ -19,6 +19,7 @@ static std::vector< std::pair<pid_t, int> > mockKillCommands;
 static std::map<std::string, std::string> pidFileContents;
 static std::set<std::string> missingPidFiles;
 static std::set<pid_t> mockAlivePids;
+static std::set<std::string> mockMissingLinks;
 
 static void writeMockPidFile(const std::string &alias, pid_t pid)
 {
@@ -240,6 +241,21 @@ int cb(const std::string &cmd, std::string &stdout)
     {
         return 1;
     }
+    for (const auto &link : mockMissingLinks)
+    {
+        if (cmd.find(link) != std::string::npos &&
+            (cmd.find("link show") != std::string::npos ||
+             cmd.find("state item set") != std::string::npos))
+        {
+            return 1;
+        }
+    }
+    if (cmd.find("/usr/bin/teamd -r -t PortChannel808") != std::string::npos)
+    {
+        mockMissingLinks.erase("PortChannel808");
+        writeMockPidFile("PortChannel808", 7781);
+        return 0;
+    }
     if (cmd.find("/usr/bin/teamd -r -t PortChannel382") != std::string::npos)
     {
         writeMockPidFile("PortChannel382", 1234);
@@ -332,6 +348,7 @@ namespace teammgr_ut
             mockCallArgs.clear();
             mockKillCommands.clear();
             mockAlivePids.clear();
+            mockMissingLinks.clear();
             missingPidFiles.clear();
             pidFileContents.clear();
             mock_nl_socket_alloc_fail = false;
@@ -742,6 +759,54 @@ namespace teammgr_ut
         {
             EXPECT_EQ(k.second, 0);
         }
+    }
+
+    TEST_F(TeamMgrTest, testActiveModeChangeWhileTeamdGoneRecreatesWithNewMode)
+    {
+        swss::TeamMgr teammgr(m_config_db.get(), m_app_db.get(), m_state_db.get(), cfg_lag_tables);
+        swss::Table cfg_lag_table = swss::Table(m_config_db.get(), CFG_LAG_TABLE_NAME);
+        cfg_lag_table.set("PortChannel808", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "active", "true" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+        ASSERT_NE(mockCallArgs.size(), 0);
+        EXPECT_NE(mockCallArgs.front().find("/usr/bin/teamd -r -t PortChannel808"), std::string::npos);
+
+        // teamd has exited and the LAG netdevice is gone
+        mockAlivePids.erase(7781);
+        mockMissingLinks.insert("PortChannel808");
+        size_t calls_after_create = mockCallArgs.size();
+
+        cfg_lag_table.set("PortChannel808", { { "admin_status", "up" },
+                                            { "mtu", "9100" },
+                                            { "lacp_key", "auto" },
+                                            { "min_links", "1" },
+                                            { "active", "false" } });
+        teammgr.addExistingData(&cfg_lag_table);
+        teammgr.doTask();
+
+        bool saw_active_set = false;
+        bool saw_recreate_passive = false;
+        for (size_t i = calls_after_create; i < mockCallArgs.size(); i++)
+        {
+            const auto &cmd = mockCallArgs[i];
+            if (cmd.find("state item set") != std::string::npos &&
+                cmd.find("runner.active") != std::string::npos)
+            {
+                saw_active_set = true;
+            }
+            if (cmd.find("/usr/bin/teamd -r -t PortChannel808") != std::string::npos &&
+                cmd.find("\"active\":false") != std::string::npos)
+            {
+                saw_recreate_passive = true;
+            }
+        }
+
+        EXPECT_FALSE(saw_active_set);
+        EXPECT_TRUE(saw_recreate_passive);
     }
 
     TEST_F(TeamMgrTest, testSleepDuringCleanup)
