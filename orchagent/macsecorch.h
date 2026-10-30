@@ -62,7 +62,7 @@ private:
     DBConnector * m_state_db;
     shared_ptr<DBConnector> m_notificationsDb;
     NotificationConsumer* m_postCompletionNotificationConsumer;
-    bool m_enable_post;
+    bool m_enable_post = false;
 
     PortsOrch * m_port_orch;
 
@@ -175,8 +175,7 @@ private:
     bool setEncodingAN(
         MACsecSC &sc,
         const TaskArgs &sc_attr,
-        sai_macsec_direction_t direction,
-        const std::string &port_sci);
+        sai_macsec_direction_t direction);
     bool createMACsecSC(
         MACsecPort &macsec_port,
         const std::string &port_name,
